@@ -9,8 +9,9 @@ https://github.com/mirandahw/aliu-voice/releases/tag/voice
 - `Injector.dex`: Injector from Aliucord/Aliucord#752 with the new voice layer + webrtc.
 - `Aliucord.zip`: core from Aliucord/Aliucord#752 (includes the `VoiceChatFix` core plugin).
 
-The repo is private, so the Manager's built-in download of `Injector.dex` from the release
-404s. Import it as a custom injector over adb instead (step 3). Everything else is normal.
+The repo is public, so Manager's "Download injector" step fetches `Injector.dex` from the
+release on its own. Step 3 (adb import as a custom injector) is only a fallback if that
+download fails; if you skip it, also skip the "Custom Injector" pick in step 4.
 
 Goal: get Miranda's existing Aliucord install (keep plugins/settings) joining voice channels.
 
@@ -25,16 +26,21 @@ Goal: get Miranda's existing Aliucord install (keep plugins/settings) joining vo
    Note the installed Aliucord package name (default `com.aliucord`) and whether the
    official Manager (`com.aliucord.manager`) is present. Leave both alone.
 
-1. Download the three release assets (needs GitHub auth since the repo is private; `gh`
-   works: `gh release download voice -R mirandahw/aliu-voice -D dist`).
+1. Download the release assets
+   ```sh
+   mkdir -p dist && cd dist
+   for f in AliucordManager-voice.apk Aliucord.zip Injector.dex; do
+     curl -sSLO "https://github.com/mirandahw/aliu-voice/releases/download/voice/$f"
+   done; cd ..
+   ```
 
 2. Install Manager
    ```sh
    adb install -r dist/AliucordManager-voice.apk
    ```
 
-3. Import the injector as a custom component (file name must be `<epochMillis>_<x.y.z>.dex`,
-   version 2.4.0 matches what the PR's Injector reports)
+3. (Fallback only) Import the injector as a custom component (file name must be
+   `<epochMillis>_<x.y.z>.dex`, version 2.4.0 matches what the PR's Injector reports)
    ```sh
    name="$(date +%s)000_2.4.0.dex"
    adb push dist/Injector.dex /data/local/tmp/$name
@@ -45,9 +51,9 @@ Goal: get Miranda's existing Aliucord install (keep plugins/settings) joining vo
    Manager opens and should toast/confirm the import.
 
 4. Patch Discord (on the phone, in "Aliucord Manager (voice)")
-   - Settings → Advanced → **Developer options** on
-   - Back → Install → keep the same app name / package name as the existing install
-   - In the Advanced section → **Custom Injector** → pick the imported 2.4.0
+   - Install → keep the same app name / package name as the existing install
+   - Only if you did step 3: Settings → Advanced → **Developer options** on, then on the
+     patch options screen → **Custom Injector** → pick the imported 2.4.0
    - Install. Expect steps "Download voice engine" and "Patch voice engine" in the list.
      It downloads Discord 126.21 (~100 MB) and the 333.12 voice split, then installs over
      the existing Aliucord as an update (it re-signs with the key embedded in the installed
