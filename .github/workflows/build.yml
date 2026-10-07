@@ -1,0 +1,181 @@
+name: Build voice-enabled Aliucord
+
+on:
+  workflow_dispatch:
+    inputs:
+      aliucord_ref:
+        description: "Aliucord/Aliucord commit to build (PR #752 head by default)"
+        required: false
+        default: ""
+      manager_ref:
+        description: "Aliucord/Manager commit to build (PR #143 head by default)"
+        required: false
+        default: ""
+      publish:
+        description: "Publish the outputs to the 'voice' GitHub release"
+        type: boolean
+        default: true
+  push:
+    branches: ["**"]
+    paths:
+      - ".github/workflows/build.yml"
+      - "debug.keystore"
+
+env:
+  # Pinned heads of the two upstream PRs. Bump these to pick up newer commits.
+  # Aliucord/Aliucord#752  secp192k1:feat/sunflower  (E2EE voice core + injector + voice module)
+  ALIUCORD_REF: ea06fcae0af8e681d18e06a39fb614fb94d25377
+  # Aliucord/Manager#143   feat/sunflower            (swaps libdiscord.so for the DAVE-capable one)
+  MANAGER_REF: 5097943c176f8e6fe4573bf623ad552ec2bdbe70
+  RELEASE_TAG: voice
+
+jobs:
+  aliucord:
+    name: Core + Injector (Aliucord#752)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Aliucord at PR #752
+        uses: actions/checkout@v4
+        with:
+          repository: Aliucord/Aliucord
+          ref: ${{ inputs.aliucord_ref || env.ALIUCORD_REF }}
+          persist-credentials: false
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build core and injector
+        run: |
+          chmod +x gradlew
+          ./gradlew --stacktrace :Aliucord:make :Injector:make
+
+      - name: Sanity-check that the voice layer made it into Injector.dex
+        run: |
+          set -e
+          dex=Injector/build/outputs/Injector.dex
+          ls -la "$dex" Aliucord/build/outputs/Aliucord.zip
+          for cls in 'Lcom/hammerandchisel/libdiscord/Discord;' 'Lcom/discord/native/engine/NativeEngine;' 'Lorg/webrtc/PeerConnectionFactory;' 'Lcom/aliucord/voice/BuildConfig;'; do
+            if grep -aqF "$cls" "$dex"; then echo "ok   $cls"; else echo "MISSING $cls"; exit 1; fi
+          done
+          unzip -l Aliucord/build/outputs/Aliucord.zip | head -20
+
+      - name: Collect outputs
+        run: |
+          mkdir -p out
+          cp Aliucord/build/outputs/Aliucord.zip out/Aliucord.zip
+          cp Injector/build/outputs/Injector.dex out/Injector.dex
+          { echo "aliucord_ref=$(git rev-parse HEAD)"; echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } > out/aliucord-build.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aliucord
+          if-no-files-found: error
+          path: out/*
+
+  manager:
+    name: Manager APK (Manager#143)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this repo (for the keystore)
+        uses: actions/checkout@v4
+        with:
+          path: self
+          persist-credentials: false
+
+      - name: Checkout Manager at PR #143
+        uses: actions/checkout@v4
+        with:
+          repository: Aliucord/Manager
+          ref: ${{ inputs.manager_ref || env.MANAGER_REF }}
+          path: manager
+          persist-credentials: false
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Use a fixed debug keystore so later builds can install over earlier ones
+        run: |
+          mkdir -p ~/.android
+          cp self/debug.keystore ~/.android/debug.keystore
+
+      - name: Point the injector download at this repo's release
+        working-directory: manager
+        run: |
+          set -e
+          f=app/src/main/kotlin/com/aliucord/manager/patcher/steps/download/DownloadInjectorStep.kt
+          old='const val URL = "https://builds.aliucord.com/Injector.dex"'
+          new="const val URL = \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/Injector.dex\""
+          grep -qF "$old" "$f" || { echo "injector URL line not found in $f, upstream changed; fix the workflow"; exit 1; }
+          sed -i "s|$old|$new|" "$f"
+          grep -n 'const val URL' "$f"
+
+      - name: Build debug APK
+        working-directory: manager
+        run: |
+          chmod +x gradlew
+          ./gradlew --stacktrace :app:assembleDebug
+
+      - name: Collect outputs
+        run: |
+          mkdir -p out
+          cp manager/app/build/outputs/apk/debug/app-debug.apk out/AliucordManager-voice.apk
+          { echo "manager_ref=$(git -C manager rev-parse HEAD)"; echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } > out/manager-build.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manager
+          if-no-files-found: error
+          path: out/*
+
+  release:
+    name: Publish to the 'voice' release
+    needs: [aliucord, manager]
+    if: ${{ github.event_name == 'push' || inputs.publish }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List
+        run: ls -la dist
+
+      - name: Create/replace release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          notes="Built $(date -u +%Y-%m-%d\ %H:%MZ) from run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+$(cat dist/aliucord-build.txt dist/manager-build.txt)
+
+Upstream sources:
+- Aliucord/Aliucord#752 https://github.com/Aliucord/Aliucord/pull/752
+- Aliucord/Manager#143 https://github.com/Aliucord/Manager/pull/143
+
+See the README for install steps."
+          gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "voice (latest build)" --notes "$notes" \
+            dist/AliucordManager-voice.apk dist/Injector.dex dist/Aliucord.zip
