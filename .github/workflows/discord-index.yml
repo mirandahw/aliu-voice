@@ -1,0 +1,92 @@
+name: Index Discord 126.21 symbols
+
+# Builds a text index of class names, superclasses, interfaces, field and method
+# signatures from the Discord APK Aliucord patches. No code bodies, no resources;
+# it's the same information Aliucord plugins reference in their hooks. Reference
+# material for writing the plugins in this repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      discord_version:
+        description: "Discord version code on maven.aliucord.com"
+        default: "126021"
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Fetch APK
+        env:
+          V: ${{ inputs.discord_version }}
+        run: |
+          set -e
+          curl -sSfL -o discord.apk "https://maven.aliucord.com/releases/com/discord/discord/$V/discord-$V.apk"
+          ls -la discord.apk
+          mkdir dex && unzip -q -o discord.apk 'classes*.dex' -d dex
+          ls -la dex
+
+      - name: Dump symbols
+        run: |
+          set -e
+          dexdump=$(ls "$ANDROID_HOME"/build-tools/*/dexdump | sort -V | tail -1)
+          echo "using $dexdump"
+          for f in dex/classes*.dex; do "$dexdump" "$f"; done > raw.txt
+          wc -l raw.txt
+          python3 - <<'EOF'
+          import re
+          out = open("symbols.txt", "w")
+          cls = None
+          section = None  # "field" or "method"
+          name = None
+          def jname(desc):
+              # 'Lcom/foo/Bar;' -> com.foo.Bar
+              d = desc.strip("'")
+              if d.startswith("L") and d.endswith(";"):
+                  return d[1:-1].replace("/", ".")
+              return d
+          for line in open("raw.txt", errors="replace"):
+              line = line.rstrip("\n")
+              m = re.match(r"\s*Class descriptor\s*:\s*'(.+)'", line)
+              if m:
+                  cls = jname(m.group(1)); section = None; name = None
+                  out.write(f"CLASS {cls}\n"); continue
+              if cls is None:
+                  continue
+              m = re.match(r"\s*Access flags\s*:\s*0x[0-9a-f]+ \((.*)\)", line)
+              if m and section is None and name is None:
+                  out.write(f"  FLAGS {cls} {m.group(1)}\n"); continue
+              m = re.match(r"\s*Superclass\s*:\s*'(.+)'", line)
+              if m:
+                  out.write(f"  EXTENDS {cls} {jname(m.group(1))}\n"); continue
+              m = re.match(r"\s*#\d+\s*:\s*'(.+)'", line)
+              if m and section is None:
+                  out.write(f"  IMPLEMENTS {cls} {jname(m.group(1))}\n"); continue
+              if re.match(r"\s*(Static|Instance) fields\s*-", line):
+                  section = "field"; continue
+              if re.match(r"\s*(Direct|Virtual) methods\s*-", line):
+                  section = "method"; continue
+              m = re.match(r"\s*name\s*:\s*'(.+)'", line)
+              if m:
+                  name = m.group(1); continue
+              m = re.match(r"\s*type\s*:\s*'(.+)'", line)
+              if m and name is not None:
+                  kind = "FIELD" if section == "field" else "METHOD"
+                  out.write(f"  {kind} {cls} {name} {m.group(1)}\n")
+                  name = None; continue
+          out.close()
+          EOF
+          wc -l symbols.txt
+          grep -c '^CLASS ' symbols.txt
+          grep -m3 'CLASS com.discord.stores.StoreStream' symbols.txt || true
+          zstd -q -19 -T0 symbols.txt -o symbols.txt.zst
+          ls -la symbols.txt.zst
+          rm -rf raw.txt dex discord.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: discord-symbols-${{ inputs.discord_version }}
+          if-no-files-found: error
+          retention-days: 90
+          path: symbols.txt.zst
