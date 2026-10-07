@@ -132,13 +132,14 @@ object Accounts {
         }
     }
 
-    private fun get(route: String, token: String): String =
-        Http.Request.newDiscordRNRequest(route)
+    private fun get(route: String, token: String): String {
+        val res = Http.Request.newDiscordRNRequest(route)
             .setHeader("Authorization", token)
             .setRequestTimeout(15000)
             .execute()
-            .assertOk()
-            .text()
+        res.assertOk()
+        return res.text()
+    }
 
     /**
      * /users/@me/guilds returns partial guilds. Rather than pushing them through Discord's

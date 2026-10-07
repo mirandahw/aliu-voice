@@ -153,6 +153,6 @@ object Switcher {
 
     /** StoreStream.handlePreLogout is private; its synthetic accessor isn't. */
     private fun preLogout() {
-        StoreStream.`access$handlePreLogout`(StoreStream.getCollector())
+        StoreStream.`access$handlePreLogout`(ChannelSelector.getInstance().stream)
     }
 }
