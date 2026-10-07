@@ -54,6 +54,20 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
+      - name: Patch a compile error in the PR head
+        # StreamSettingsSheet is a BottomSheet (a Fragment), which only exposes
+        # setPadding(int) (applies the value to all four sides of its layout).
+        # The PR head calls the 4-arg View overload and does not compile.
+        run: |
+          set -e
+          f=Aliucord/src/main/java/com/aliucord/coreplugins/voice/ui/StreamSettingsSheet.kt
+          if grep -qF '        setPadding(p, p, p, p)' "$f"; then
+            sed -i 's|^        setPadding(p, p, p, p)$|        setPadding(p)|' "$f"
+            echo "patched $f"; grep -n 'setPadding(p)' "$f"
+          else
+            echo "pattern not present (fixed upstream?), skipping"
+          fi
+
       - name: Build core and injector
         run: |
           chmod +x gradlew
