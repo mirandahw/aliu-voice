@@ -85,6 +85,26 @@ adb shell am start -n com.aliucord.manager.voice/com.aliucord.manager.MainActivi
 Then in Manager: Settings → Developer options → on. On the patch options screen pick
 **Custom Injector** → the imported 2.4.0, and patch.
 
+## Plugins
+
+`plugins/` is a standard Aliucord plugin project (same layout as Aliucord/plugins-template).
+`.github/workflows/plugins.yml` builds every plugin on push, publishes the zips to the
+**`plugins`** pre-release and to the `builds` branch (so Aliucord's in-app updater can see them
+via jsdelivr).
+
+### SideAccount
+
+Keeps extra accounts' tokens and shows their servers at the bottom of the server sidebar and
+their DMs behind account chips at the top of the DM panel. Tapping any of them switches the
+client to that account and opens the thing you tapped. Only one account is ever live; the
+others' lists come from REST (`/users/@me/guilds`, `/users/@me/channels`) with their own token.
+
+Install: download `SideAccount.zip` from the `plugins` release → `Internal storage/Aliucord/plugins/`
+→ restart Aliucord → Aliucord settings → Plugins → SideAccount → add an account (Discord's login
+screen, or paste a token).
+
+Switching restarts the app by default; "in place" switching is an experimental toggle.
+
 ## Notes
 
 - `debug.keystore` is a throwaway Android debug key (password `android`). It is committed
