@@ -5,6 +5,7 @@ import com.aliucord.api.SettingsAPI
 import com.discord.stores.StoreCollapsedChannelCategories
 import com.discord.stores.StoreEmoji
 import com.discord.stores.StoreStream
+import com.discord.utilities.channel.ChannelSelector
 import com.discord.utilities.frecency.FrecencyTracker
 import com.discord.utilities.persister.Persister
 import org.json.JSONArray
@@ -33,6 +34,14 @@ object AccountState {
     private val frecencyHistory by lazy { field(FrecencyTracker::class.java, "history") }
     private val frecencyDirty by lazy { field(FrecencyTracker::class.java, "dirty") }
     private val collapsedMap by lazy { field(StoreCollapsedChannelCategories::class.java, "collapsedCategories") }
+
+    /** StoreStream only exposes this store through an internal getter, so pull it off the instance by type. */
+    private val collapsedStore: StoreCollapsedChannelCategories by lazy {
+        val stream = ChannelSelector.getInstance().stream
+        val f = StoreStream::class.java.declaredFields.first { it.type == StoreCollapsedChannelCategories::class.java }
+        f.isAccessible = true
+        f.get(stream) as StoreCollapsedChannelCategories
+    }
 
     /** StoreV2.markChanged() is what makes a store re-snapshot and persist. Protected, so reflection. */
     private val markChanged by lazy {
@@ -102,7 +111,7 @@ object AccountState {
     private fun snapshotCollapsed(accountId: Long) {
         try {
             val json = JSONObject()
-            for ((guildId, categories) in HashMap(collapsed(StoreStream.getCollapsedChannelCategories()))) {
+            for ((guildId, categories) in HashMap(collapsed(collapsedStore))) {
                 json.put(guildId.toString(), JSONArray(categories))
             }
             settings.setString("collapsed_$accountId", json.toString())
@@ -114,7 +123,7 @@ object AccountState {
     private fun restoreCollapsed(accountId: Long) {
         val raw = settings.getString("collapsed_$accountId", null) ?: return
         try {
-            val store = StoreStream.getCollapsedChannelCategories()
+            val store = collapsedStore
             val map = collapsed(store)
             val json = JSONObject(raw)
             map.clear()
