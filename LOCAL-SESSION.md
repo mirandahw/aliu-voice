@@ -99,14 +99,36 @@ Goal: get Miranda's existing Aliucord install (keep plugins/settings) joining vo
 ## SideAccount plugin (second pass, after voice works)
 
 Source: `plugins/SideAccount/`. Built zip: https://github.com/mirandahw/aliu-voice/releases/tag/plugins
-(`SideAccount.zip`). It has never run on a device; expect to iterate.
+(`SideAccount.zip`).
 
 ```sh
 curl -sSLO https://github.com/mirandahw/aliu-voice/releases/download/plugins/SideAccount.zip
 adb push SideAccount.zip /sdcard/Aliucord/plugins/SideAccount.zip
 adb shell am force-stop com.aliucord && adb shell monkey -p com.aliucord 1
-adb logcat -s Aliucord:* SideAccount:* AndroidRuntime:E
+adb logcat -s Discord:V AndroidRuntime:E      # Aliucord + plugins log under the "Discord" tag on this device
 ```
+
+### 0.2.0 test list (after the 0.1.0 run on 2026-10-07)
+0.1.0 findings are fixed in 0.2.0: restart is the default, store mutations go through the dispatcher,
+the live account is matched by user id, tokens moved to app-private prefs (migrated automatically on
+first start; the shared settings file should no longer contain `"token"`), 429 retry, cached lists.
+New in 0.2.0: side servers follow the owning account's `guild_folders` order; recent emojis and
+collapsed categories are snapshotted per account before a switch and restored after READY.
+
+1. First start: confirm `SideAccount.json` has no `"token"` fields and
+   `/data/data/com.aliucord/shared_prefs/sideaccount_tokens.xml` exists (needs `adb shell run-as`
+   or root; skip if not possible). Side servers should show immediately from cache.
+2. Sidebar on account A: B's servers appear in B's own order. Switch to B: A's servers appear in
+   A's order (this was the "jumbled" complaint).
+3. Emojis: on A, use a couple of emojis, switch to B, use different ones, switch back to A. A's
+   recents should be A's, not B's and not empty. Same for collapsing a category in a server on each
+   account and switching back and forth.
+4. Login-screen add flow (settings → "Log in with Discord's login screen"): should now actually drop
+   to the auth landing with no store-thread errors in logcat, and no request to /auth/logout.
+5. Experimental in-place switch (toggle off): expect a brief flash to the landing screen, then the new
+   account. Logcat should show `Sending identify` + `Ready payload`. If no READY within 30s it
+   restarts on its own. Report either way; this path is optional.
+6. Rate limit: switch back and forth quickly; the side lists should still be complete (429s retried).
 
 Then on the phone: Aliucord settings → Plugins → SideAccount (gear) → "Add by token" is the
 quickest first test (paste the second account's token). After that:

@@ -11,6 +11,7 @@ import com.aliucord.patcher.before
 import com.aliucord.wrappers.ChannelWrapper.Companion.id
 import com.discord.api.channel.Channel
 import com.discord.stores.StoreAuthentication
+import com.discord.stores.StoreStream
 import com.discord.widgets.channels.list.WidgetChannelListModel
 import com.discord.widgets.channels.list.WidgetChannelsList
 import com.discord.widgets.channels.list.WidgetChannelsListAdapter
@@ -46,10 +47,12 @@ class SideAccount : Plugin() {
     override fun start(context: Context) {
         Accounts.settings = settings
         Switcher.settings = settings
+        AccountState.settings = settings
+        Accounts.init(context)
 
         // Make sure the live account is on the list, then pull data for the others.
         Accounts.currentToken()?.let { tok ->
-            if (Accounts.current() == null) Accounts.registerAsync(tok) { Accounts.refreshSideDataAsync() }
+            if (!Accounts.knowsToken(tok)) Accounts.registerAsync(tok) { Accounts.refreshSideDataAsync() }
             else Accounts.refreshSideDataAsync()
         }
         Switcher.resumePending(context)
@@ -70,7 +73,7 @@ class SideAccount : Plugin() {
     private fun patchAuth() {
         patcher.after<StoreAuthentication>("setAuthed", String::class.java) { param ->
             val token = param.args[0] as? String ?: return@after
-            if (Accounts.all.none { it.token == token }) {
+            if (!Accounts.knowsToken(token)) {
                 Accounts.registerAsync(token) { Accounts.refreshSideDataAsync() }
             }
         }
@@ -99,7 +102,7 @@ class SideAccount : Plugin() {
             FragmentManager::class.java,
         ) { param ->
             val item = param.args[0] as? GuildListItem.GuildItem ?: return@before
-            val owner = Accounts.ownerOfGuild(item.guild.id) ?: return@before
+            val owner = Accounts.ownerOfGuild(item.guild) ?: return@before
             param.result = null
             Switcher.switchTo(owner, Pending(owner.id, guildId = item.guild.id), param.args[1] as Context)
         }
@@ -107,26 +110,33 @@ class SideAccount : Plugin() {
         // Long press would open a context menu for a guild the stores don't know. Swallow it.
         patcher.before<WidgetGuildsListViewModel>("onItemLongPressed", GuildListItem::class.java) { param ->
             val item = param.args[0] as? GuildListItem.GuildItem ?: return@before
-            if (Accounts.isSideGuild(item.guild.id)) param.result = null
+            if (Accounts.isSideGuild(item.guild)) param.result = null
         }
 
         // No drag and drop for side guilds: Discord would try to save folder positions with foreign ids.
         patcher.after<GuildListViewHolder.GuildViewHolder>("canDrag") { param ->
             val data = guildViewHolderData(this) ?: return@after
-            if (Accounts.isSideGuild(data.guild.id)) param.result = false
+            if (Accounts.isSideGuild(data.guild)) param.result = false
         }
 
         // Dim side guilds a touch so they read as "elsewhere".
         patcher.after<GuildListViewHolder.GuildViewHolder>("configure", GuildListItem.GuildItem::class.java) { param ->
             val item = param.args[0] as GuildListItem.GuildItem
-            itemView.alpha = if (Accounts.isSideGuild(item.guild.id)) 0.7f else 1f
+            itemView.alpha = if (Accounts.isSideGuild(item.guild)) 0.7f else 1f
         }
     }
 
     private fun sideGuildItems(): List<GuildListItem> {
         val out = ArrayList<GuildListItem>()
+        val liveGuilds = try {
+            StoreStream.getGuilds().guilds
+        } catch (t: Throwable) {
+            emptyMap<Long, Any>()
+        }
         for (acc in Accounts.others()) {
             for (guild in Accounts.sideData(acc.id).guilds) {
+                // A server both accounts are in is already in the sidebar; don't show it twice.
+                if (liveGuilds.containsKey(guild.id)) continue
                 out += GuildListItem.GuildItem(
                     guild,
                     0, // mentionCount
@@ -196,7 +206,7 @@ class SideAccount : Plugin() {
             if (current === state.wrappedSelect) return@after
             val ctx = requireContext()
             val wrapped: (Channel) -> Unit = { channel ->
-                val owner = Accounts.ownerOfDm(channel.id)
+                val owner = Accounts.ownerOfDm(channel)
                 if (owner != null) Switcher.switchTo(owner, Pending(owner.id, channelId = channel.id), ctx)
                 else current.invoke(channel)
             }
@@ -205,7 +215,7 @@ class SideAccount : Plugin() {
 
             val currentOptions = adapter.onSelectChannelOptions
             adapter.onSelectChannelOptions = { channel ->
-                if (!Accounts.isSideDm(channel.id)) currentOptions.invoke(channel)
+                if (!Accounts.isSideDm(channel)) currentOptions.invoke(channel)
             }
         }
     }
@@ -225,6 +235,7 @@ class SideAccount : Plugin() {
             items += ChannelListItemPrivate(channel, null, false, 0, false, false)
         }
         items.addAll(tail)
+        // isGuildSelected=false, showPremiumGuildHint=false, showEmptyState only when there's nothing to show
 
         return WidgetChannelListModel(null, items, false, false, items.none { it is ChannelListItemPrivate }, emptyList())
     }

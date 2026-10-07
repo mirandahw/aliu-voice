@@ -80,7 +80,7 @@ class SideAccountSettings : SettingsPage() {
                     .setOnOkListener {
                         Utils.threadPool.execute {
                             try {
-                                Switcher.signOutLocally(ctx)
+                                Switcher.signOutLocally()
                             } catch (t: Throwable) {
                                 Utils.showToast("Couldn't start: ${t.message}")
                             }
@@ -124,7 +124,7 @@ class SideAccountSettings : SettingsPage() {
                 ctx,
                 CheckedSetting.ViewType.SWITCH,
                 "Restart app when switching",
-                "On: slower but reliable. Off: swap the session in place (experimental; falls back to a restart if it blows up).",
+                "On (default): reliable, a few seconds. Off: swap the session in place (experimental; falls back to a restart if the new account never connects).",
             ).apply {
                 isChecked = Switcher.restartOnSwitch
                 setOnCheckedListener { Switcher.settings.setBool(Switcher.KEY_RESTART_ON_SWITCH, it) }
