@@ -10,9 +10,14 @@ upstream pull requests at pinned commits and builds them:
 | Aliucord core (`Aliucord.zip`) + Injector (`Injector.dex`, which bundles the new voice layer and webrtc) | [Aliucord/Aliucord#752](https://github.com/Aliucord/Aliucord/pull/752) | `ea06fcae` |
 | Aliucord Manager APK, which swaps Discord's `libdiscord.so` for the DAVE-capable one (v333.12) | [Aliucord/Manager#143](https://github.com/Aliucord/Manager/pull/143) | `5097943c` |
 
-The only local change is a one-line patch to Manager so it downloads `Injector.dex` from
-this repo's release instead of `builds.aliucord.com`. That is what lets you install
-without adb.
+Local changes, both applied by the workflow at build time:
+
+- Manager: one-line patch so it downloads `Injector.dex` from this repo's release instead
+  of `builds.aliucord.com`. That is what lets you install without adb.
+- Aliucord: `StreamSettingsSheet.kt` calls `setPadding(p, p, p, p)` on a `BottomSheet`,
+  which only has `setPadding(int)`, so the PR head doesn't compile as of `ea06fcae`. The
+  workflow rewrites it to `setPadding(p)` (same effect). The step skips itself once
+  upstream fixes it.
 
 Outputs land on the **`voice`** pre-release: `AliucordManager-voice.apk`, `Injector.dex`,
 `Aliucord.zip`.
