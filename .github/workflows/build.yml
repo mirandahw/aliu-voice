@@ -165,17 +165,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          notes="Built $(date -u +%Y-%m-%d\ %H:%MZ) from run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-
-$(cat dist/aliucord-build.txt dist/manager-build.txt)
-
-Upstream sources:
-- Aliucord/Aliucord#752 https://github.com/Aliucord/Aliucord/pull/752
-- Aliucord/Manager#143 https://github.com/Aliucord/Manager/pull/143
-
-See the README for install steps."
+          {
+            echo "Built $(date -u +%Y-%m-%d\ %H:%MZ) from run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            cat dist/aliucord-build.txt dist/manager-build.txt
+            echo
+            echo "Upstream sources:"
+            echo "- Aliucord/Aliucord#752 https://github.com/Aliucord/Aliucord/pull/752"
+            echo "- Aliucord/Manager#143 https://github.com/Aliucord/Manager/pull/143"
+            echo
+            echo "See the README for install steps."
+          } > notes.md
           gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
           gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" --prerelease \
-            --title "voice (latest build)" --notes "$notes" \
+            --title "voice (latest build)" --notes-file notes.md \
             dist/AliucordManager-voice.apk dist/Injector.dex dist/Aliucord.zip
