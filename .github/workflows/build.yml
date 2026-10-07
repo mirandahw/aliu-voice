@@ -140,6 +140,19 @@ jobs:
           sed -i "s|$old|$new|" "$f"
           grep -n 'const val URL' "$f"
 
+      - name: Give the build its own package id and label so it installs next to official Manager
+        working-directory: manager
+        run: |
+          set -e
+          g=app/build.gradle.kts
+          grep -qF '    buildTypes {' "$g" || { echo "buildTypes block not found in $g"; exit 1; }
+          sed -i 's|^    buildTypes {$|    buildTypes {\n        getByName("debug") { applicationIdSuffix = ".voice" }|' "$g"
+          grep -n -A1 'buildTypes {' "$g"
+          s=app/src/main/res/values/strings.xml
+          grep -qF '<string name="app_name">Aliucord Manager</string>' "$s" || { echo "app_name not found in $s"; exit 1; }
+          sed -i 's|<string name="app_name">Aliucord Manager</string>|<string name="app_name">Aliucord Manager (voice)</string>|' "$s"
+          grep -n app_name "$s"
+
       - name: Build debug APK
         working-directory: manager
         run: |

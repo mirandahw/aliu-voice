@@ -10,10 +10,12 @@ upstream pull requests at pinned commits and builds them:
 | Aliucord core (`Aliucord.zip`) + Injector (`Injector.dex`, which bundles the new voice layer and webrtc) | [Aliucord/Aliucord#752](https://github.com/Aliucord/Aliucord/pull/752) | `ea06fcae` |
 | Aliucord Manager APK, which swaps Discord's `libdiscord.so` for the DAVE-capable one (v333.12) | [Aliucord/Manager#143](https://github.com/Aliucord/Manager/pull/143) | `5097943c` |
 
-Local changes, both applied by the workflow at build time:
+Local changes, all applied by the workflow at build time:
 
 - Manager: one-line patch so it downloads `Injector.dex` from this repo's release instead
   of `builds.aliucord.com`. That is what lets you install without adb.
+- Manager: package id `com.aliucord.manager.voice` and label "Aliucord Manager (voice)" so
+  it installs alongside the official Manager instead of replacing it.
 - Aliucord: `StreamSettingsSheet.kt` calls `setPadding(p, p, p, p)` on a `BottomSheet`,
   which only has `setPadding(int)`, so the PR head doesn't compile as of `ea06fcae`. The
   workflow rewrites it to `setPadding(p)` (same effect). The step skips itself once
@@ -26,15 +28,18 @@ Outputs land on the **`voice`** pre-release: `AliucordManager-voice.apk`, `Injec
 
 You need Android 7.0+ (arm64 or armv7). Everything below happens on the phone.
 
-1. **Uninstall the official Aliucord Manager** if you have it. This build uses the same
-   package name but a different signing key, so it can't install over it.
-   (Your existing Aliucord install and its settings/plugins are untouched.)
-2. Install `AliucordManager-voice.apk` from the release.
-3. Open Manager and patch Discord as usual (Install → pick a name/icon → Install).
-   Watch the step list: it should include **"Download voice engine"** and
+Nothing gets uninstalled. The official Manager can stay; this build installs next to it
+as "Aliucord Manager (voice)". Your existing Aliucord install is updated in place: Manager
+reads the signing key embedded in the installed Aliucord APK and re-signs with it, so
+plugins, settings and themes carry over.
+
+1. Install `AliucordManager-voice.apk` from the release.
+2. Open "Aliucord Manager (voice)", grant storage access when asked, and patch Discord as
+   usual (Install → keep the same app name / package name as your current Aliucord →
+   Install). Watch the step list: it should include **"Download voice engine"** and
    **"Patch voice engine"**. The "Download injector" step pulls `Injector.dex` from this
    repo's release automatically.
-   Let it install over your existing Aliucord. First launch after a reinstall may be slow.
+   It installs over your existing Aliucord as an update. First launch may be slow.
 4. Download `Aliucord.zip` from the release and put it at
    `Internal storage/Aliucord/Aliucord.zip` (same folder your `plugins` and `settings`
    dirs live in).
@@ -71,7 +76,7 @@ custom injector manually:
 
 ```sh
 adb push Injector.dex /data/local/tmp/1700000000000_2.4.0.dex
-adb shell am start -n com.aliucord.manager/.MainActivity \
+adb shell am start -n com.aliucord.manager.voice/com.aliucord.manager.MainActivity \
   -a com.aliucord.manager.IMPORT_COMPONENT \
   --es aliucord.file 1700000000000_2.4.0.dex \
   --es aliucord.componentType injector
