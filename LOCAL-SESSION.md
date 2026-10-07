@@ -108,6 +108,22 @@ adb shell am force-stop com.aliucord && adb shell monkey -p com.aliucord 1
 adb logcat -s Discord:V AndroidRuntime:E      # Aliucord + plugins log under the "Discord" tag on this device
 ```
 
+### 0.3.0 test list (after the 0.2.0 run)
+Storage: on first start logcat should say `Moved N entries out of the shared settings file and removed
+M keys`; afterwards `/sdcard/Aliucord/settings/SideAccount.json` should be empty or gone (Aliucord may
+recreate it as `{}`). Private copies: `shared_prefs/sideaccount.xml`, `sideaccount_tokens.xml`,
+`files/sideaccount/*.json`.
+1. Bug A: tap side servers repeatedly, including right after launch and ~5-10 s later (after the
+   background refresh). Every tap must toast "Switching to …"; zero `Closed cleanly ... 4000` lines.
+2. Bug B: a restart switch to a server should show exactly one `Sending identify` / one READY.
+3. Bug C: no `AccountState.restore` (or "collapsed categories" lines) before `Sending identify`; no
+   `/users/@me/guilds` call with the live token from SideAccount (other plugins' calls aside).
+4. Bug E: the other account's folders appear as folders (collapsed); tapping one opens it; the
+   servers not in any folder sit above the folders. Order should match that account's own sidebar.
+5. Bug D: logcat on a restore should no longer say "markChanged not found"; if it still does, send the
+   `saw: [...]` list it prints now.
+6. Bug F: in-place switch (toggle off) and check whether channels still show unread.
+
 ### 0.2.0 test list (after the 0.1.0 run on 2026-10-07)
 0.1.0 findings are fixed in 0.2.0: restart is the default, store mutations go through the dispatcher,
 the live account is matched by user id, tokens moved to app-private prefs (migrated automatically on

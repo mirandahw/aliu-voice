@@ -3,7 +3,6 @@ package com.mirandahw.sideaccount
 import android.content.Context
 import com.aliucord.Logger
 import com.aliucord.Utils
-import com.aliucord.api.SettingsAPI
 import com.discord.stores.StoreStream
 import com.discord.utilities.channel.ChannelSelector
 
@@ -15,13 +14,16 @@ object Switcher {
     const val KEY_RESTART_ON_SWITCH = "restartOnSwitch"
 
     private val logger = Logger("SideAccount")
-    lateinit var settings: SettingsAPI
 
     @Volatile
     var switching = false
         private set
 
-    val restartOnSwitch get() = settings.getBool(KEY_RESTART_ON_SWITCH, true)
+    /** True once a gateway READY has been handled in this process (set by the plugin's READY hook). */
+    @Volatile
+    var readySeen = false
+
+    val restartOnSwitch get() = Storage.getBool(KEY_RESTART_ON_SWITCH, true)
 
     /**
      * Swap the client over to [account] and then navigate to [target] once the new session is up.
@@ -41,26 +43,37 @@ object Switcher {
             return
         }
         switching = true
-        settings.setString(KEY_PENDING, "${target.accountId}:${target.guildId}:${target.channelId}")
+        Storage.putString(KEY_PENDING, "${target.accountId}:${target.guildId}:${target.channelId}")
         Utils.showToast("Switching to ${account.tag}…")
         AccountState.snapshot(Accounts.liveUserId())
 
         if (restartOnSwitch) {
+            // Discord persists the selected guild and subscribes to it right after READY. If that's the
+            // old account's guild the server kicks the socket (4000) and it reconnects once more. Point
+            // it at where we're going (or at Home) before the restart; set() runs on the dispatcher and
+            // is persisted on dispatch end, hence the short delay.
+            try {
+                StoreStream.getGuildSelected().set(target.guildId)
+            } catch (t: Throwable) {
+                logger.warn("Couldn't pre-select guild before restart", t)
+            }
             // setAuthed persists the token through AuthStateCache, so a cold start comes up as the new account.
             StoreStream.getAuthentication().setAuthed(token)
-            Utils.mainThread.postDelayed({ Utils.restartAliucord(ctx) }, 250)
+            Utils.mainThread.postDelayed({ Utils.restartAliucord(ctx) }, 700)
             return
         }
 
-        // Experimental in-place switch. Everything that touches stores has to run on the store
-        // dispatcher thread. The gateway only reconnects when the token goes null and back, because
-        // a token change on an open socket is a no-op (StoreGatewayConnection.handleClientStateUpdate).
+        // Experimental in-place switch. The gateway only reconnects when the token goes null and back,
+        // because a token change on an open socket is a no-op (StoreGatewayConnection.handleClientStateUpdate).
+        // setAuthed(null) is a full local logout (clears cached auth state, persisted stores, the
+        // selected guild), so handlePreLogout is not needed on top; skipping it is also the experiment
+        // for the "everything unread after an in-place switch" report.
+        readySeen = false
         StoreStream.getDispatcherYesThisIsIntentional().schedule {
             try {
                 val auth = StoreStream.getAuthentication()
-                preLogout()
-                auth.setAuthed(null) // local logout: closes the gateway, resets per-user state
-                auth.setAuthed(token) // and back in as the other account
+                auth.setAuthed(null)
+                auth.setAuthed(token)
             } catch (t: Throwable) {
                 logger.error("In-place switch failed, falling back to a restart", t)
                 Utils.mainThread.post { restartInto(token, ctx) }
@@ -72,16 +85,16 @@ object Switcher {
 
     /** Called on plugin start: if a restart-based switch left a navigation target, finish it. */
     fun resumePending(ctx: Context) {
-        val raw = settings.getString(KEY_PENDING, null) ?: return
+        val raw = Storage.getString(KEY_PENDING) ?: return
         val parts = raw.split(":")
         if (parts.size != 3) {
-            settings.remove(KEY_PENDING)
+            Storage.remove(KEY_PENDING)
             return
         }
         val pending = Pending(parts[0].toLong(), parts[1].toLong(), parts[2].toLong())
         val acc = Accounts.byId(pending.accountId)
         if (acc == null || Accounts.tokenOf(acc.id) != Accounts.currentToken()) {
-            settings.remove(KEY_PENDING)
+            Storage.remove(KEY_PENDING)
             return
         }
         switching = true
@@ -89,7 +102,7 @@ object Switcher {
     }
 
     /**
-     * Polls until the stores say the new user is in (READY has landed) and the target exists, then selects it.
+     * Polls until a READY for the new user has been handled and the target exists, then selects it.
      * [restartOnTimeout] is for the in-place path: no READY for the new user within 30s means the hot
      * switch didn't take, so do it the reliable way.
      */
@@ -134,14 +147,14 @@ object Switcher {
 
     private fun finish(target: Pending) {
         switching = false
-        settings.remove(KEY_PENDING)
+        Storage.remove(KEY_PENDING)
         if (Accounts.liveUserId() == target.accountId) {
             // READY has been processed by now (that's what we waited for), so the stores' own
             // pruning is done and it's safe to put this account's state back.
             StoreStream.getDispatcherYesThisIsIntentional().schedule { AccountState.restore(target.accountId) }
             navigate(target)
         }
-        Accounts.refreshSideDataAsync()
+        Utils.mainThread.postDelayed({ Accounts.refreshSideDataAsync() }, 3000)
     }
 
     private fun navigate(target: Pending) {
@@ -167,9 +180,9 @@ object Switcher {
             Accounts.register(tok)
         }
         AccountState.snapshot(Accounts.liveUserId())
+        readySeen = false
         StoreStream.getDispatcherYesThisIsIntentional().schedule {
             try {
-                preLogout()
                 // Same as what Discord's own logout does locally (minus the /auth/logout call):
                 // publishes a null auth state, which clears cached auth + persisted stores and
                 // drops the app onto the auth landing screen.
@@ -179,10 +192,5 @@ object Switcher {
                 Utils.showToast("Couldn't sign out locally, add the account by token instead")
             }
         }
-    }
-
-    /** StoreStream.handlePreLogout is private; its synthetic accessor isn't. Store thread only. */
-    private fun preLogout() {
-        StoreStream.`access$handlePreLogout`(ChannelSelector.getInstance().stream)
     }
 }

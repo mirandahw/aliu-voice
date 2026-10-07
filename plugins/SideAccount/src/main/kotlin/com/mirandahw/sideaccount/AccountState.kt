@@ -1,7 +1,6 @@
 package com.mirandahw.sideaccount
 
 import com.aliucord.Logger
-import com.aliucord.api.SettingsAPI
 import com.discord.stores.StoreCollapsedChannelCategories
 import com.discord.stores.StoreEmoji
 import com.discord.stores.StoreStream
@@ -10,6 +9,7 @@ import com.discord.utilities.frecency.FrecencyTracker
 import com.discord.utilities.persister.Persister
 import org.json.JSONArray
 import org.json.JSONObject
+import java.lang.reflect.Method
 
 /**
  * Discord keeps a few bits of per-user state in caches that have no idea which user they belong to:
@@ -25,7 +25,6 @@ import org.json.JSONObject
  */
 object AccountState {
     private val logger = Logger("SideAccount")
-    lateinit var settings: SettingsAPI
 
     private fun field(cls: Class<*>, name: String) = cls.getDeclaredField(name).apply { isAccessible = true }
 
@@ -43,15 +42,36 @@ object AccountState {
         f.get(stream) as StoreCollapsedChannelCategories
     }
 
-    /** StoreV2.markChanged() is what makes a store re-snapshot and persist. Protected, so reflection. */
-    private val markChanged by lazy {
+    /**
+     * StoreV2.markChanged() is what makes a store re-snapshot and persist on dispatch end. It's
+     * protected, so reflection; accept either the no-arg or the vararg UpdateSource overload.
+     */
+    private val markChanged: Pair<Method, Boolean>? by lazy {
+        var found: Pair<Method, Boolean>? = null
         var c: Class<*>? = StoreCollapsedChannelCategories::class.java
-        var m: java.lang.reflect.Method? = null
-        while (c != null && m == null) {
-            m = c.declaredMethods.firstOrNull { it.name == "markChanged" && it.parameterTypes.isEmpty() }
+        val seen = ArrayList<String>()
+        while (c != null && found == null) {
+            val methods = try {
+                c.declaredMethods.toList()
+            } catch (t: Throwable) {
+                logger.warn("declaredMethods failed on ${c.name}", t)
+                emptyList()
+            }
+            for (m in methods) {
+                if (m.name != "markChanged") continue
+                seen += "${c.simpleName}.${m.name}(${m.parameterTypes.joinToString { it.simpleName }})"
+                if (m.parameterTypes.isEmpty()) {
+                    found = m.apply { isAccessible = true } to false
+                    break
+                }
+                if (m.parameterTypes.size == 1 && m.parameterTypes[0].isArray) {
+                    found = m.apply { isAccessible = true } to true
+                }
+            }
             c = c.superclass
         }
-        m?.apply { isAccessible = true }
+        if (found == null) logger.warn("markChanged not found; saw: $seen")
+        found
     }
 
     fun snapshot(accountId: Long) {
@@ -77,14 +97,14 @@ object AccountState {
             val tracker = emojiFrecency.get(StoreStream.getEmojis()) ?: return
             val json = JSONObject()
             for ((key, samples) in HashMap(history(tracker))) json.put(key.toString(), JSONArray(samples))
-            settings.setString("emoji_$accountId", json.toString())
+            Storage.writeBlob("emoji_$accountId", json.toString())
         } catch (t: Throwable) {
             logger.warn("Couldn't snapshot emoji history", t)
         }
     }
 
     private fun restoreEmoji(accountId: Long) {
-        val raw = settings.getString("emoji_$accountId", null) ?: return
+        val raw = Storage.readBlob("emoji_$accountId") ?: return
         try {
             val store = StoreStream.getEmojis()
             val tracker = emojiFrecency.get(store) ?: return
@@ -114,14 +134,14 @@ object AccountState {
             for ((guildId, categories) in HashMap(collapsed(collapsedStore))) {
                 json.put(guildId.toString(), JSONArray(categories))
             }
-            settings.setString("collapsed_$accountId", json.toString())
+            Storage.writeBlob("collapsed_$accountId", json.toString())
         } catch (t: Throwable) {
             logger.warn("Couldn't snapshot collapsed categories", t)
         }
     }
 
     private fun restoreCollapsed(accountId: Long) {
-        val raw = settings.getString("collapsed_$accountId", null) ?: return
+        val raw = Storage.readBlob("collapsed_$accountId") ?: return
         try {
             val store = collapsedStore
             val map = collapsed(store)
@@ -131,7 +151,14 @@ object AccountState {
                 val arr = json.getJSONArray(key)
                 map[key.toLong()] = HashSet<Long>().apply { for (i in 0 until arr.length()) add(arr.getLong(i)) }
             }
-            markChanged?.invoke(store) ?: logger.warn("markChanged not found; collapsed categories restored in memory only")
+            val mc = markChanged
+            if (mc == null) {
+                logger.warn("collapsed categories restored in memory only")
+            } else if (mc.second) {
+                mc.first.invoke(store, java.lang.reflect.Array.newInstance(mc.first.parameterTypes[0].componentType!!, 0))
+            } else {
+                mc.first.invoke(store)
+            }
         } catch (t: Throwable) {
             logger.warn("Couldn't restore collapsed categories", t)
         }

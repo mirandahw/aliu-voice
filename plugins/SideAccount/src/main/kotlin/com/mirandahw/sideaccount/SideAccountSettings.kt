@@ -127,7 +127,7 @@ class SideAccountSettings : SettingsPage() {
                 "On (default): reliable, a few seconds. Off: swap the session in place (experimental; falls back to a restart if the new account never connects).",
             ).apply {
                 isChecked = Switcher.restartOnSwitch
-                setOnCheckedListener { Switcher.settings.setBool(Switcher.KEY_RESTART_ON_SWITCH, it) }
+                setOnCheckedListener { Storage.putBool(Switcher.KEY_RESTART_ON_SWITCH, it) }
             },
         )
 

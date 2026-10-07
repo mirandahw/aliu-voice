@@ -5,7 +5,6 @@ import android.content.SharedPreferences
 import com.aliucord.Http
 import com.aliucord.Logger
 import com.aliucord.Utils
-import com.aliucord.api.SettingsAPI
 import com.aliucord.utils.GsonUtils
 import com.aliucord.utils.GsonUtils.fromJson
 import com.aliucord.wrappers.ChannelWrapper.Companion.id
@@ -15,13 +14,8 @@ import com.discord.stores.StoreStream
 import com.discord.utilities.rest.RestAPI
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.Collections
-import java.util.IdentityHashMap
 
-/**
- * An account the plugin knows about. Display metadata only; the token lives in app-private
- * SharedPreferences (see [Accounts.tokenOf]), never in the shared /sdcard/Aliucord settings file.
- */
+/** An account the plugin knows about. Display metadata only; the token lives in [Accounts.tokenOf]. */
 data class Account(
     val id: Long,
     val username: String,
@@ -31,44 +25,68 @@ data class Account(
     val tag get() = if (discriminator == "0" || discriminator.isEmpty()) username else "$username#$discriminator"
 }
 
-/** Gson-friendly holder, avoids needing TypeToken (obfuscated in the Discord APK). */
-class AccountList(val accounts: ArrayList<Account> = arrayListOf())
+/** One entry of an account's sidebar, in sidebar order: a folder, or a single guild. */
+class SideFolder(val id: Long, val name: String?, val color: Int?, val guildIds: List<Long>)
 
 /** What we last fetched for an account that isn't the live one. */
 class SideData(
-    val guilds: List<Guild> = emptyList(),
+    /** All guilds by id. */
+    val guilds: Map<Long, Guild> = emptyMap(),
+    /** Sidebar order: folders (possibly single-guild, unnamed ones) as Discord stores them. */
+    val folders: List<SideFolder> = emptyList(),
     val dms: List<Channel> = emptyList(),
 )
 
 object Accounts {
     private const val KEY_ACCOUNTS = "accounts"
-    private const val KEY_SIDE_PREFIX = "side_"
     private const val TOKEN_PREFS = "sideaccount_tokens"
     private val logger = Logger("SideAccount")
 
-    lateinit var settings: SettingsAPI
     private lateinit var tokens: SharedPreferences
 
-    @Volatile
-    private var cached: AccountList? = null
+    /** Invoked (main thread) whenever side data changes, so the sidebar can re-render. */
+    var onSideDataChanged: (() -> Unit)? = null
 
-    /** In-memory guilds/DMs per account id, for accounts other than the live one. */
+    @Volatile
+    private var cached: List<Account>? = null
+
     private val side = HashMap<Long, SideData>()
 
-    /**
-     * The Guild / Channel objects we built ourselves, mapped to their owner. Side items are recognised by
-     * identity, not by id, so a server both accounts are in never gets mistaken for a side item.
-     */
-    private val sideObjects: MutableMap<Any, Long> = Collections.synchronizedMap(IdentityHashMap())
+    /** guild id / DM channel id / folder id -> owning account id, for everything in [side]. */
+    private val guildOwner = HashMap<Long, Long>()
+    private val dmOwner = HashMap<Long, Long>()
+    private val folderOwner = HashMap<Long, Long>()
 
     fun init(ctx: Context) {
         tokens = ctx.getSharedPreferences(TOKEN_PREFS, Context.MODE_PRIVATE)
-        migrateTokens()
         loadCaches()
     }
 
     val all: List<Account>
-        get() = (cached ?: settings.getObject(KEY_ACCOUNTS, AccountList()).also { cached = it }).accounts
+        get() = cached ?: load().also { cached = it }
+
+    private fun load(): List<Account> {
+        val raw = Storage.getString(KEY_ACCOUNTS) ?: return emptyList()
+        return try {
+            val arr = JSONObject(raw).getJSONArray("accounts")
+            List(arr.length()) { i ->
+                val o = arr.getJSONObject(i)
+                Account(o.getLong("id"), o.getString("username"), o.optString("discriminator", "0"), o.optString("avatar", null))
+            }
+        } catch (t: Throwable) {
+            logger.warn("Unreadable account list, starting empty", t)
+            emptyList()
+        }
+    }
+
+    private fun save(list: List<Account>) {
+        cached = list
+        val arr = JSONArray()
+        for (a in list) {
+            arr.put(JSONObject().put("id", a.id).put("username", a.username).put("discriminator", a.discriminator).put("avatar", a.avatar))
+        }
+        Storage.putString(KEY_ACCOUNTS, JSONObject().put("accounts", arr).toString())
+    }
 
     fun tokenOf(id: Long): String? = tokens.getString(id.toString(), null)
 
@@ -80,14 +98,17 @@ object Accounts {
         null
     }
 
-    /** The id of whoever the stores say is logged in, or 0 before READY. */
-    fun liveUserId(): Long = try {
+    /**
+     * The id of whoever the stores say is logged in. StoreUser.me is restored from Discord's disk
+     * cache at startup, so it's only trusted once a READY has landed in this process.
+     */
+    fun liveUserId(): Long = if (!Switcher.readySeen) 0L else try {
         StoreStream.getUsers().me.id
     } catch (t: Throwable) {
         0L
     }
 
-    /** The live account: by user id once the stores are up, by token before that. */
+    /** The live account: by user id after READY, by token before that. */
     fun current(): Account? {
         val me = liveUserId()
         if (me != 0L) all.firstOrNull { it.id == me }?.let { return it }
@@ -105,24 +126,49 @@ object Accounts {
 
     fun sideData(accountId: Long): SideData = side[accountId] ?: SideData()
 
-    fun ownerOfGuild(guild: Guild): Account? = sideObjects[guild]?.let(::byId)
-    fun ownerOfDm(channel: Channel): Account? = sideObjects[channel]?.let(::byId)
-    fun isSideGuild(guild: Guild) = sideObjects.containsKey(guild)
-    fun isSideDm(channel: Channel) = sideObjects.containsKey(channel)
+    // ---- "is this one of ours?" -----------------------------------------------------------------
+    // Keyed by id, with the live stores as the tiebreaker: anything the live account actually has is
+    // never a side item, whatever another account's list says. That keeps the answer stable across
+    // refreshes (objects get rebuilt, ids don't).
 
-    private fun save(list: AccountList) {
-        cached = list
-        settings.setObject(KEY_ACCOUNTS, list)
+    private fun liveHasGuild(id: Long) = try {
+        StoreStream.getGuilds().getGuild(id) != null
+    } catch (t: Throwable) {
+        false
     }
 
+    private fun liveHasChannel(id: Long) = try {
+        StoreStream.getChannels().getChannel(id) != null
+    } catch (t: Throwable) {
+        false
+    }
+
+    fun ownerOfGuild(guild: Guild): Account? {
+        if (liveHasGuild(guild.id)) return null
+        val owner = guildOwner[guild.id] ?: return null
+        return byId(owner)?.takeIf { it.id != current()?.id }
+    }
+
+    fun ownerOfDm(channel: Channel): Account? {
+        if (liveHasChannel(channel.id)) return null
+        val owner = dmOwner[channel.id] ?: return null
+        return byId(owner)?.takeIf { it.id != current()?.id }
+    }
+
+    fun isSideGuild(guild: Guild) = ownerOfGuild(guild) != null
+    fun isSideDm(channel: Channel) = ownerOfDm(channel) != null
+    fun isSideFolder(folderId: Long) = folderOwner[folderId]?.let { it != current()?.id } ?: false
+
+    // ---- mutations ------------------------------------------------------------------------------
+
     fun remove(id: Long) {
-        save(AccountList(ArrayList(all.filter { it.id != id })))
+        save(all.filter { it.id != id })
         tokens.edit().remove(id.toString()).apply()
-        settings.remove(KEY_SIDE_PREFIX + id)
-        side.remove(id)?.let { data ->
-            data.guilds.forEach(sideObjects::remove)
-            data.dms.forEach(sideObjects::remove)
-        }
+        Storage.deleteBlob("side_$id")
+        Storage.deleteBlob("emoji_$id")
+        Storage.deleteBlob("collapsed_$id")
+        uninstall(id)
+        notifyChanged()
     }
 
     /** Verifies a token against /users/@me and stores (or updates) the account. Blocking, call off the main thread. */
@@ -136,7 +182,7 @@ object Accounts {
             avatar = me.optString("avatar", null),
         )
         tokens.edit().putString(acc.id.toString(), token).apply()
-        save(AccountList(ArrayList(all.filter { it.id != acc.id }).apply { add(acc) }))
+        save(all.filter { it.id != acc.id } + acc)
         return acc
     }
 
@@ -154,6 +200,7 @@ object Accounts {
 
     /** Refreshes guild + DM lists for every account except the live one. Blocking. */
     fun refreshSideData() {
+        var changed = false
         for ((index, acc) in others().withIndex()) {
             val token = tokenOf(acc.id) ?: continue
             if (index > 0) Thread.sleep(600) // be gentle, the per-route bucket is small
@@ -162,25 +209,21 @@ object Accounts {
                 val dmsRaw = get("/users/@me/channels", token)
                 // The account's own sidebar order lives in its user settings (guild_folders, or the
                 // older guild_positions). Without it /users/@me/guilds comes back in no useful order.
-                val order = try {
-                    guildOrder(get("/users/@me/settings", token))
+                val foldersRaw = try {
+                    foldersJson(get("/users/@me/settings", token))
                 } catch (t: Throwable) {
                     logger.warn("Couldn't fetch sidebar order for ${acc.tag}", t)
-                    emptyList()
+                    JSONArray()
                 }
-                install(acc.id, guildsRaw, dmsRaw, order)
-                settings.setString(
-                    KEY_SIDE_PREFIX + acc.id,
-                    JSONObject()
-                        .put("guilds", JSONArray(guildsRaw))
-                        .put("dms", dmsRaw)
-                        .put("order", JSONArray(order))
-                        .toString(),
-                )
+                val blob = JSONObject().put("guilds", JSONArray(guildsRaw)).put("dms", dmsRaw).put("folders", foldersRaw).toString()
+                install(acc.id, blob)
+                Storage.writeBlob("side_${acc.id}", blob)
+                changed = true
             } catch (t: Throwable) {
                 logger.error("Failed to fetch data for ${acc.tag}", t)
             }
         }
+        if (changed) notifyChanged()
     }
 
     fun refreshSideDataAsync(then: (() -> Unit)? = null) {
@@ -190,82 +233,74 @@ object Accounts {
         }
     }
 
-    // ---- internals ----------------------------------------------------------------------------
+    private fun notifyChanged() {
+        onSideDataChanged?.let { Utils.mainThread.post(it) }
+    }
+
+    // ---- internals ------------------------------------------------------------------------------
 
     /** Cached lists from the last run, so the sidebar is populated right after a restart. */
     private fun loadCaches() {
         for (acc in all) {
-            val raw = settings.getString(KEY_SIDE_PREFIX + acc.id, null) ?: continue
+            val raw = Storage.readBlob("side_${acc.id}") ?: continue
             try {
-                val o = JSONObject(raw)
-                val order = o.optJSONArray("order")?.let { arr -> List(arr.length()) { arr.getLong(it) } } ?: emptyList()
-                install(acc.id, o.getJSONArray("guilds").toString(), o.getString("dms"), order)
+                install(acc.id, raw)
             } catch (t: Throwable) {
                 logger.warn("Dropping unreadable cache for ${acc.tag}", t)
-                settings.remove(KEY_SIDE_PREFIX + acc.id)
+                Storage.deleteBlob("side_${acc.id}")
             }
         }
     }
 
-    private fun install(accountId: Long, guildsRaw: String, dmsRaw: String, order: List<Long>) {
+    private fun uninstall(accountId: Long) {
         side.remove(accountId)?.let { old ->
-            old.guilds.forEach(sideObjects::remove)
-            old.dms.forEach(sideObjects::remove)
+            old.guilds.keys.forEach { if (guildOwner[it] == accountId) guildOwner.remove(it) }
+            old.dms.forEach { if (dmOwner[it.id] == accountId) dmOwner.remove(it.id) }
+            old.folders.forEach { if (folderOwner[it.id] == accountId) folderOwner.remove(it.id) }
         }
-        val position = order.withIndex().associate { (i, id) -> id to i }
-        val guilds = parseGuilds(guildsRaw).sortedBy { position[it.id] ?: Int.MAX_VALUE }
-        val dms = parseDms(dmsRaw)
-        guilds.forEach { sideObjects[it] = accountId }
-        dms.forEach { sideObjects[it] = accountId }
-        side[accountId] = SideData(guilds, dms)
     }
 
-    /** Flattens guild_folders (or legacy guild_positions) from /users/@me/settings into one ordered id list. */
-    private fun guildOrder(settingsRaw: String): List<Long> {
+    private fun install(accountId: Long, blob: String) {
+        val o = JSONObject(blob)
+        val guilds = parseGuilds(o.getJSONArray("guilds").toString())
+        val dms = parseDms(o.getString("dms"))
+        val folders = parseFolders(o.optJSONArray("folders") ?: JSONArray())
+        synchronized(side) {
+            uninstall(accountId)
+            guilds.keys.forEach { guildOwner[it] = accountId }
+            dms.forEach { dmOwner[it.id] = accountId }
+            folders.forEach { if (it.name != null || it.guildIds.size > 1) folderOwner[it.id] = accountId }
+            side[accountId] = SideData(guilds, folders, dms)
+        }
+    }
+
+    /**
+     * guild_folders entries: {id, name, color, guild_ids}. A plain top-level server is an entry with a
+     * null id and one guild. Legacy guild_positions is turned into one such entry per guild.
+     */
+    private fun foldersJson(settingsRaw: String): JSONArray {
         val o = JSONObject(settingsRaw)
-        val out = ArrayList<Long>()
-        val folders = o.optJSONArray("guild_folders")
-        if (folders != null) {
-            for (i in 0 until folders.length()) {
-                val ids = folders.getJSONObject(i).optJSONArray("guild_ids") ?: continue
-                for (j in 0 until ids.length()) out += ids.getString(j).toLong()
-            }
-        } else {
-            val positions = o.optJSONArray("guild_positions") ?: return out
-            for (i in 0 until positions.length()) out += positions.getString(i).toLong()
+        o.optJSONArray("guild_folders")?.let { return it }
+        val out = JSONArray()
+        val positions = o.optJSONArray("guild_positions") ?: return out
+        for (i in 0 until positions.length()) {
+            out.put(JSONObject().put("guild_ids", JSONArray().put(positions.getString(i))))
         }
         return out
     }
 
-    /** 0.1.0 kept tokens inside the shared settings file. Move them to private prefs once. */
-    private fun migrateTokens() {
-        val raw = try {
-            settings.getString(KEY_ACCOUNTS, null)
-        } catch (t: Throwable) {
-            null
-        } ?: return
-        try {
-            val arr = JSONObject(raw).optJSONArray("accounts") ?: return
-            var moved = false
-            val editor = tokens.edit()
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val tok = o.optString("token", "")
-                if (tok.isNotEmpty()) {
-                    editor.putString(o.getString("id"), tok)
-                    o.remove("token")
-                    moved = true
-                }
-            }
-            if (moved) {
-                editor.apply()
-                settings.setString(KEY_ACCOUNTS, JSONObject().put("accounts", arr).toString())
-                cached = null
-                logger.info("Moved stored tokens out of the shared settings file")
-            }
-        } catch (t: Throwable) {
-            logger.warn("Token migration skipped", t)
+    private fun parseFolders(arr: JSONArray): List<SideFolder> {
+        val out = ArrayList<SideFolder>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            val ids = o.optJSONArray("guild_ids") ?: continue
+            val guildIds = List(ids.length()) { ids.getString(it).toLong() }
+            if (guildIds.isEmpty()) continue
+            val id = if (o.isNull("id")) -guildIds.first() else o.getLong("id") // single guilds get a synthetic id
+            val color = if (o.isNull("color")) null else o.getInt("color")
+            out += SideFolder(id, if (o.isNull("name")) null else o.getString("name"), color, guildIds)
         }
+        return out
     }
 
     private fun get(route: String, token: String, attempt: Int = 0): String {
@@ -274,12 +309,8 @@ object Accounts {
             .setRequestTimeout(15000)
             .execute()
         if (res.statusCode == 429 && attempt < 3) {
-            val wait = try {
-                (JSONObject(res.text()).optDouble("retry_after", 1.0) * 1000).toLong() + 100
-            } catch (t: Throwable) {
-                1500L
-            }
-            Thread.sleep(wait.coerceIn(200L, 10_000L))
+            // The body (retry_after) isn't readable through Http.Response on an error status; back off blind.
+            Thread.sleep(1500L * (attempt + 1))
             return get(route, token, attempt + 1)
         }
         res.assertOk()
@@ -291,13 +322,14 @@ object Accounts {
      * Guild(ApiGuild) constructor (which expects a full gateway guild and would blow up on the
      * nulls), build empty model guilds and fill in the handful of fields the sidebar renders.
      */
-    private fun parseGuilds(raw: String): List<Guild> {
+    private fun parseGuilds(raw: String): Map<Long, Guild> {
         val arr = JSONArray(raw)
-        val out = ArrayList<Guild>(arr.length())
+        val out = LinkedHashMap<Long, Guild>(arr.length())
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
-            out += Guild().also { g ->
-                setField(g, "id", o.getString("id").toLong())
+            val id = o.getString("id").toLong()
+            out[id] = Guild().also { g ->
+                setField(g, "id", id)
                 setField(g, "name", o.getString("name"))
                 setField(g, "icon", o.optString("icon", null))
                 setField(g, "features", HashSet<Any>())
@@ -328,7 +360,4 @@ object Accounts {
         f.isAccessible = true
         f.set(target, value)
     }
-
-    @Suppress("unused")
-    private fun channelId(ch: Channel) = ch.id
 }

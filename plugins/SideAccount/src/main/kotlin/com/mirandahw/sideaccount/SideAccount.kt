@@ -10,6 +10,7 @@ import com.aliucord.patcher.after
 import com.aliucord.patcher.before
 import com.aliucord.wrappers.ChannelWrapper.Companion.id
 import com.discord.api.channel.Channel
+import com.discord.models.guild.Guild
 import com.discord.stores.StoreAuthentication
 import com.discord.stores.StoreStream
 import com.discord.widgets.channels.list.WidgetChannelListModel
@@ -21,6 +22,7 @@ import com.discord.widgets.guilds.list.GuildListItem
 import com.discord.widgets.guilds.list.GuildListViewHolder
 import com.discord.widgets.guilds.list.WidgetGuildsList
 import com.discord.widgets.guilds.list.WidgetGuildsListViewModel
+import java.lang.ref.WeakReference
 import java.util.WeakHashMap
 
 /**
@@ -44,17 +46,17 @@ class SideAccount : Plugin() {
 
     private val panels = WeakHashMap<WidgetChannelsList, PanelState>()
 
-    override fun start(context: Context) {
-        Accounts.settings = settings
-        Switcher.settings = settings
-        AccountState.settings = settings
-        Accounts.init(context)
+    /** The sidebar widget and the last state Discord handed it, so we can re-render on our own. */
+    private var sidebar: WeakReference<WidgetGuildsList>? = null
+    private var lastSidebarState: WidgetGuildsListViewModel.ViewState? = null
 
-        // Make sure the live account is on the list, then pull data for the others.
-        Accounts.currentToken()?.let { tok ->
-            if (!Accounts.knowsToken(tok)) Accounts.registerAsync(tok) { Accounts.refreshSideDataAsync() }
-            else Accounts.refreshSideDataAsync()
-        }
+    override fun start(context: Context) {
+        Storage.init(context, settings)
+        Accounts.init(context)
+        Accounts.onSideDataChanged = { rerenderSidebar() }
+
+        // Make sure the live account is on the list. Side data refreshes once READY lands (see patchAuth).
+        Accounts.currentToken()?.let { tok -> if (!Accounts.knowsToken(tok)) Accounts.registerAsync(tok) }
         Switcher.resumePending(context)
 
         patchAuth()
@@ -65,27 +67,39 @@ class SideAccount : Plugin() {
     override fun stop(context: Context) {
         patcher.unpatchAll()
         panels.clear()
+        Accounts.onSideDataChanged = null
     }
 
     // ---- auth -------------------------------------------------------------------------------
 
-    /** Any login (Discord's screen, TokenLogin, our own switch) ends up in setAuthed. Remember the token. */
     private fun patchAuth() {
+        // Any login (Discord's screen, TokenLogin, our own switch) ends up in setAuthed. Remember the token.
         patcher.after<StoreAuthentication>("setAuthed", String::class.java) { param ->
             val token = param.args[0] as? String ?: return@after
-            if (!Accounts.knowsToken(token)) {
-                Accounts.registerAsync(token) { Accounts.refreshSideDataAsync() }
-            }
+            if (!Accounts.knowsToken(token)) Accounts.registerAsync(token)
+        }
+
+        // StoreUser.me comes back from disk before READY, so "who is live" is only trusted after this.
+        patcher.after<StoreStream>("handleConnectionReady", Boolean::class.javaPrimitiveType!!) { param ->
+            if (param.args[0] != true) return@after
+            val first = !Switcher.readySeen
+            Switcher.readySeen = true
+            // Side lists are already on screen from cache; refresh a little later so we don't pile onto
+            // the /users/@me/* buckets other plugins hit at startup.
+            if (first) Utils.mainThread.postDelayed({ Accounts.refreshSideDataAsync() }, 4000)
+            rerenderSidebar()
         }
     }
 
     // ---- guild sidebar ----------------------------------------------------------------------
 
     private fun patchGuildSidebar() {
-        // Append the other accounts' guilds, behind a divider, right above the bottom-nav spacer.
+        // Append the other accounts' sidebars (folders and all), behind a divider, above the bottom-nav spacer.
         patcher.before<WidgetGuildsList>("configureUI", WidgetGuildsListViewModel.ViewState::class.java) { param ->
+            sidebar = WeakReference(this)
             val loaded = param.args[0] as? WidgetGuildsListViewModel.ViewState.Loaded ?: return@before
-            val extra = sideGuildItems()
+            lastSidebarState = loaded
+            val extra = sideItems()
             if (extra.isEmpty()) return@before
 
             val items = ArrayList<GuildListItem>(loaded.items)
@@ -102,21 +116,40 @@ class SideAccount : Plugin() {
             FragmentManager::class.java,
         ) { param ->
             val item = param.args[0] as? GuildListItem.GuildItem ?: return@before
-            val owner = Accounts.ownerOfGuild(item.guild) ?: return@before
-            param.result = null
-            Switcher.switchTo(owner, Pending(owner.id, guildId = item.guild.id), param.args[1] as Context)
+            val owner = Accounts.ownerOfGuild(item.guild)
+            if (owner != null) {
+                param.result = null
+                Switcher.switchTo(owner, Pending(owner.id, guildId = item.guild.id), param.args[1] as Context)
+                return@before
+            }
+            // Safety net: never let Discord select a guild the stores don't have. Subscribing to it gets
+            // the socket closed with 4000 over and over.
+            if (StoreStream.getGuilds().getGuild(item.guild.id) == null) {
+                param.result = null
+                Utils.showToast("That server isn't available right now")
+            }
         }
 
-        // Long press would open a context menu for a guild the stores don't know. Swallow it.
+        // Long press would open a context menu for a guild/folder the stores don't know. Swallow it.
         patcher.before<WidgetGuildsListViewModel>("onItemLongPressed", GuildListItem::class.java) { param ->
-            val item = param.args[0] as? GuildListItem.GuildItem ?: return@before
-            if (Accounts.isSideGuild(item.guild)) param.result = null
+            when (val item = param.args[0]) {
+                is GuildListItem.GuildItem -> if (Accounts.isSideGuild(item.guild)) param.result = null
+                is GuildListItem.FolderItem -> if (Accounts.isSideFolder(item.folderId)) param.result = null
+            }
         }
 
-        // No drag and drop for side guilds: Discord would try to save folder positions with foreign ids.
+        // No drag and drop for side items: Discord would try to save folder positions with foreign ids.
         patcher.after<GuildListViewHolder.GuildViewHolder>("canDrag") { param ->
             val data = guildViewHolderData(this) ?: return@after
             if (Accounts.isSideGuild(data.guild)) param.result = false
+        }
+        try {
+            patcher.after<GuildListViewHolder.FolderViewHolder>("canDrag") { param ->
+                val data = folderViewHolderData(this) ?: return@after
+                if (Accounts.isSideFolder(data.folderId)) param.result = false
+            }
+        } catch (t: Throwable) {
+            logger.warn("FolderViewHolder.canDrag not patchable", t)
         }
 
         // Dim side guilds a touch so they read as "elsewhere".
@@ -126,45 +159,88 @@ class SideAccount : Plugin() {
         }
     }
 
-    private fun sideGuildItems(): List<GuildListItem> {
+    /** The other accounts' sidebars, in their own order, with their folders. */
+    private fun sideItems(): List<GuildListItem> {
         val out = ArrayList<GuildListItem>()
-        val liveGuilds = try {
-            StoreStream.getGuilds().guilds
+        val openFolders = try {
+            StoreStream.getExpandedGuildFolders().openFolderIds
         } catch (t: Throwable) {
-            emptyMap<Long, Any>()
+            emptySet<Long>()
         }
         for (acc in Accounts.others()) {
-            for (guild in Accounts.sideData(acc.id).guilds) {
-                // A server both accounts are in is already in the sidebar; don't show it twice.
-                if (liveGuilds.containsKey(guild.id)) continue
-                out += GuildListItem.GuildItem(
-                    guild,
-                    0, // mentionCount
-                    false, // isSelected
-                    false, // isUnread
-                    false, // isConnectedToVoice
-                    null, // folderId
-                    false, // isTargetedForFolderCreation
-                    false, // hasActiveStageChannel / isConnectedToStageChannel
-                    false,
-                    null, // isLastGuildInFolder
-                    null, // applicationStatus
-                    false, // isPendingGuild
-                    false, // isLurkingGuild
-                    false, // hasOngoingApplicationStream
-                    false, // hasActiveScheduledEvent
-                )
+            val data = Accounts.sideData(acc.id)
+            // A server both accounts are in is already in the sidebar; don't show it twice.
+            val guilds = data.guilds.filterValues { Accounts.isSideGuild(it) }
+            if (guilds.isEmpty()) continue
+
+            val placed = HashSet<Long>()
+            val ordered = ArrayList<GuildListItem>()
+            for (folder in data.folders) {
+                val members = folder.guildIds.mapNotNull { guilds[it] }
+                if (members.isEmpty()) continue
+                placed += members.map { it.id }
+                val isFolder = folder.name != null || folder.guildIds.size > 1
+                if (!isFolder) {
+                    ordered += guildItem(members[0], null, null)
+                    continue
+                }
+                val open = folder.id in openFolders
+                ordered += GuildListItem.FolderItem(folder.id, folder.color, folder.name, open, members, false, false, false, 0, false, false)
+                if (open) members.forEachIndexed { i, g -> ordered += guildItem(g, folder.id, i == members.lastIndex) }
             }
+            // Discord shows servers that aren't in the saved positions at the top.
+            for (g in guilds.values) if (g.id !in placed) out += guildItem(g, null, null)
+            out.addAll(ordered)
         }
         return out
     }
 
+    private fun guildItem(guild: Guild, folderId: Long?, lastInFolder: Boolean?) = GuildListItem.GuildItem(
+        guild,
+        0, // mentionCount
+        false, // isLurkingGuild
+        false, // isUnread
+        false, // isSelected
+        folderId,
+        false, // isConnectedToVoice
+        false, // hasOngoingApplicationStream
+        false, // isTargetedForFolderCreation
+        lastInFolder,
+        null, // applicationStatus
+        false, // isPendingGuild
+        false, // hasActiveStageChannel
+        false, // isConnectedToStageChannel
+        false, // hasActiveScheduledEvent
+    )
+
     private val guildVhDataField by lazy {
         GuildListViewHolder.GuildViewHolder::class.java.getDeclaredField("data").apply { isAccessible = true }
+    }
+    private val folderVhDataField by lazy {
+        GuildListViewHolder.FolderViewHolder::class.java.getDeclaredField("data").apply { isAccessible = true }
     }
 
     private fun guildViewHolderData(vh: GuildListViewHolder.GuildViewHolder): GuildListItem.GuildItem? =
         guildVhDataField.get(vh) as? GuildListItem.GuildItem
+
+    private fun folderViewHolderData(vh: GuildListViewHolder.FolderViewHolder): GuildListItem.FolderItem? = try {
+        folderVhDataField.get(vh) as? GuildListItem.FolderItem
+    } catch (t: Throwable) {
+        null
+    }
+
+    /** Push the last state Discord gave the sidebar through our hook again (after a refresh, READY, ...). */
+    private fun rerenderSidebar() {
+        val widget = sidebar?.get() ?: return
+        val state = lastSidebarState ?: return
+        Utils.mainThread.post {
+            try {
+                if (widget.view != null) WidgetGuildsList.`access$configureUI`(widget, state)
+            } catch (t: Throwable) {
+                logger.warn("Sidebar re-render failed", t)
+            }
+        }
+    }
 
     // ---- DM panel ---------------------------------------------------------------------------
 
@@ -232,11 +308,11 @@ class SideAccount : Plugin() {
 
         items.addAll(head)
         for (channel in Accounts.sideData(accountId).dms) {
+            if (!Accounts.isSideDm(channel)) continue // a group DM both accounts are in
             items += ChannelListItemPrivate(channel, null, false, 0, false, false)
         }
         items.addAll(tail)
         // isGuildSelected=false, showPremiumGuildHint=false, showEmptyState only when there's nothing to show
-
         return WidgetChannelListModel(null, items, false, false, items.none { it is ChannelListItemPrivate }, emptyList())
     }
 
