@@ -96,6 +96,43 @@ Goal: get Miranda's existing Aliucord install (keep plugins/settings) joining vo
 - Mic/camera permission prompts are expected on first use. Screenshare also needs the
   foreground-service permissions Manager#143 adds to the manifest.
 
+## SideAccount plugin (second pass, after voice works)
+
+Source: `plugins/SideAccount/`. Built zip: https://github.com/mirandahw/aliu-voice/releases/tag/plugins
+(`SideAccount.zip`). It has never run on a device; expect to iterate.
+
+```sh
+curl -sSLO https://github.com/mirandahw/aliu-voice/releases/download/plugins/SideAccount.zip
+adb push SideAccount.zip /sdcard/Aliucord/plugins/SideAccount.zip
+adb shell am force-stop com.aliucord && adb shell monkey -p com.aliucord 1
+adb logcat -s Aliucord:* SideAccount:* AndroidRuntime:E
+```
+
+Then on the phone: Aliucord settings → Plugins → SideAccount (gear) → "Add by token" is the
+quickest first test (paste the second account's token). After that:
+1. Server sidebar: the other account's servers should appear below a divider, slightly dimmed.
+   Tap one → toast "Switching to …" → app restarts → lands in that server.
+2. DM panel (Home): a chip row appears under the header. Tap the other account's chip → its DMs
+   list. Tap a DM → switch → that DM opens.
+3. Switch back by tapping any of the first account's servers (they now show as the side account).
+4. Then try "Log in with Discord's login screen" from the settings page: it should drop to the
+   auth landing without hitting /auth/logout; log in as the other account; both should be listed.
+5. Flip "Restart app when switching" off and repeat 1. If the client wedges (stale guilds, no
+   reconnect, crash), that's the experimental in-place path; turn it back on and report what
+   logcat said.
+
+Things that may need code changes (report exact logcat lines back to the cloud session):
+- `GuildListItem.GuildItem` constructor arg order (15 args; a wrong boolean just mis-renders).
+- `WidgetChannelListModel` constructor arg order (selectedGuild, items, isGuildSelected,
+  showPremiumGuildHint, showEmptyState, events) — if the DM tab shows the empty state, swap the
+  two booleans.
+- The chip row position: it's added as the last child of the panel's `CustomAppBarLayout`.
+- The settings page uses `R.i.UiKit_Settings_Item*` styles; if rows look wrong, that's cosmetic.
+
+To rebuild after a fix: push to the branch, CI republishes the `plugins` release in ~3 min.
+Aliucord's own updater also sees it via the `builds` branch (jsdelivr caches for a while, so the
+release download is the quicker path).
+
 ## Upstream references
 
 - Aliucord/Aliucord#752 (pinned `ea06fcae`): https://github.com/Aliucord/Aliucord/pull/752
